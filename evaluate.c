@@ -251,9 +251,9 @@ __perf_collect(struct eval_context* ctx)
 static void
 __perf_print_and_reset(struct eval_context* ctx)
 {
-    printf("cycles:      %llu\n", ctx->stats.cycles    );
-    printf("l1d_refill:  %llu\n", ctx->stats.l1d_refill);
-    printf("l2d_refill:  %llu\n", ctx->stats.l2d_refill);
+    printf("%llu,%llu,%llu\n", ctx->stats.cycles
+                             , ctx->stats.l1d_refill
+                             , ctx->stats.l2d_refill);
 
     ctx->stats.cycles     = 0ULL;
     ctx->stats.l1d_refill = 0ULL;
@@ -286,8 +286,9 @@ main(int argc, char** argv)
 
     RUN_EXP(ctx);
     RUN_EXP(ctx);
+    RUN_EXP(ctx);
     
-    printf(">> baseline\n");
+    printf("b,");
     __perf_collect(ctx);
     __perf_print_and_reset(ctx);
 
@@ -297,7 +298,7 @@ main(int argc, char** argv)
         
         RUN_EXP(ctx);
 
-        printf(">> run:%d\n", i);
+        printf("%d,", i);
         __perf_collect(ctx);
         __perf_print_and_reset(ctx);
     }

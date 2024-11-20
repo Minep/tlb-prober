@@ -4,3 +4,4 @@
 !modtlbi/
 !modtlbi/modtlbi.c
 !modtlbi/Makefile
+!run.sh
