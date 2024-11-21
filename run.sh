@@ -1,3 +1,10 @@
 #!/bin/bash
 
-sudo taskset -c 3 chrt --rr 99 ./evaluate --cpu 3 --samples 32 --scatter 64 > result.txt
+items=("32" "64" "128" "256" "512")
+CPU=3
+
+for nr in "${items[@]}"; do
+    sudo chrt --rr 99 taskset -c $CPU ./evaluate --cpu $CPU --samples 1024 --scatter $nr > result.$nr.txt
+done
+
+

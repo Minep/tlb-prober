@@ -12,11 +12,13 @@
 #include <sys/ioctl.h>
 #include <linux/perf_event.h>
 
-#define FLUSH_ALL_CMD "all"
-#define MAX_SCATTER 256
+#include "primes.h"
 
-#define SCATTERS_RANGE  1024
-#define READ_BUFFER_SZ  1024
+#define FLUSH_ALL_CMD "all"
+#define MAX_SCATTER     512
+
+#define SCATTERS_RANGE  8
+#define READ_BUFFER_SZ  4096
 #define MIN_SCATTER     8
 
 #define PMU_CPU_CYCLES          0x0011
@@ -36,6 +38,10 @@
         }                                                   \
         ret;                                                \
     })
+
+
+#define log(type, cycle, l1, l2)    \
+        printf(#type ",%llu,%llu,%llu\n", cycle, l1, l2)
 
 typedef unsigned long ptr_t;
 
@@ -153,23 +159,31 @@ __parse_args(struct eval_param* param, int argc, char** argv)
     }
 }
 
+#define abs(x)  (x < 0 ? -x : x)
+#define sgn(x)  (x < 0 ? -1 : 1)
+
 static void
 __prepare_regions(struct eval_context* ctx)
 {
-    ptr_t va = 0;
+    ptr_t va = 0, start = 0;
     int pgsz = sysconf(_SC_PAGESIZE);
     int scatter = MAX_SCATTER;
+    int rand_off;
+    int opts = MAP_OPTS;
 
     ctx->p_locs = (ptr_t*)calloc(sizeof(ptr_t), scatter);
 
-    for (int i = 0; i < scatter; ++i)
+    for (int i = 0; i < MAX_SCATTER; ++i)
     {
-        if (va) {
-            va += ((rand() % SCATTERS_RANGE) - (SCATTERS_RANGE / 2)) * pgsz;
-        }
-        
-        va = (ptr_t)ensure(mmap, (void*)va, pgsz, PROT_WRITE, MAP_OPTS, 0, 0);
+        va = (ptr_t)ensure(mmap, (void*)va, pgsz, PROT_WRITE, opts, 0, 0);
+        log(loc, va, 0, 0);
         ctx->p_locs[i] = va;
+        
+        if (!start) {
+            start = va;
+        }
+
+        va = start + (primes[i] / 2) * pgsz;
     }
 }
 
@@ -188,17 +202,18 @@ __create_context(struct eval_param* param)
     struct perf_event_attr evt;
     memset(&evt, 0, sizeof(evt));
 
-    evt.type = PERF_TYPE_RAW;
     evt.disabled = true;
     evt.exclude_hv = true;
     evt.exclude_kernel = true;
     evt.size = sizeof(evt);
 
-    evt.config      = PMU_CPU_CYCLES;
-    evt.pinned = true;
+    evt.type        = PERF_TYPE_HARDWARE;
+    evt.config      = PERF_COUNT_HW_CPU_CYCLES;
+    evt.pinned      = true;
     ctx->pmu_cycles = perf_event_open(&evt, getpid(), param->affinity, -1, 0);
 
     evt.pinned = 0;
+    evt.type        = PERF_TYPE_RAW;
     evt.config      = PMU_L2D_TLB_REFILL;
     ctx->pmu_l2rf   = perf_event_open(&evt, getpid(), param->affinity, ctx->pmu_cycles, 0);
 
@@ -266,59 +281,88 @@ __perf_reset_stats(struct eval_context* ctx)
     ctx->stats.l2d_refill = 0ULL;
 }
 
-#define log(type, cycle, l1, l2)    \
-        printf(#type ",%llu,%llu,%llu\n", cycle, l1, l2)
-
-
 #define CALIBRATE_REPEAT      10
 
-static void
+static void no_optimize
 run_bench(struct eval_context* ctx)
 {
     register int repeat, scatter;
-    register int** arr;
+    register volatile int** arr;
     
     repeat  = ctx->param.sample_cnt;
     scatter = ctx->param.nr_scatter;
-    arr     = ctx->c_locs;
+    arr     = (volatile int**)ctx->c_locs;
 
     flush_tlb(ctx);
 
     // warm up
     perf(ctx, {
-        BENCH_BODY(arr, MIN_SCATTER, 2);
+        BENCH_BODY(arr, MIN_SCATTER, 1);
     });
 
-    // calibrate for noise
-    perf(ctx, {
-        BENCH_BODY(arr, MIN_SCATTER, CALIBRATE_REPEAT);
-    });
+    // correction for noise
+    for (register int i = 0; i < CALIBRATE_REPEAT; i++)
+    {
+        perf(ctx, {
+            
+        });
+        __perf_collect(ctx);
+    }
     
-    __perf_collect(ctx);
-    log(base, ctx->stats.cycles / CALIBRATE_REPEAT
-            , ctx->stats.l1d_refill
-            , ctx->stats.l2d_refill);
+    log(base, ctx->stats.cycles     / CALIBRATE_REPEAT
+            , ctx->stats.l1d_refill / CALIBRATE_REPEAT
+            , ctx->stats.l2d_refill / CALIBRATE_REPEAT);
     
     __perf_reset_stats(ctx);
 
-    // collect latency of l1 miss but l2 hit.
 
     flush_tlb(ctx);
 
     // warm up
     perf(ctx, {
-        BENCH_BODY(arr, MAX_SCATTER, 1);
+        BENCH_BODY(arr, MIN_SCATTER, 1);
     });
 
-    perf(ctx, {
-        BENCH_BODY(arr, MIN_SCATTER * 2, 1);
-    });
-
-    __perf_collect(ctx);
-    log(l1miss, ctx->stats.cycles
-              , ctx->stats.l1d_refill
-              , ctx->stats.l2d_refill);
+    // correction for noise
+    for (register int i = 0; i < CALIBRATE_REPEAT; i++)
+    {
+        perf(ctx, {
+            BENCH_BODY(arr, MIN_SCATTER, 1);
+        });
+        __perf_collect(ctx);
+    }
+    
+    log(no_miss, ctx->stats.cycles  / CALIBRATE_REPEAT
+            , MIN_SCATTER
+            , 0);
+    
     __perf_reset_stats(ctx);
+
+
+    /* collect latency of l1 miss but l2 hit.*/
+
+    for (register int i = 0; i < CALIBRATE_REPEAT; i++)
+    {
+        flush_tlb(ctx);
+
+        // warm up
+        perf(ctx, {
+            BENCH_BODY(arr, MAX_SCATTER, 2);
+        });
+
+        perf(ctx, {
+            BENCH_BODY(arr, MIN_SCATTER, 1);
+        });
+        __perf_collect(ctx);
+    }
+
+    log(l1miss, ctx->stats.cycles / CALIBRATE_REPEAT
+              , ctx->stats.l1d_refill / CALIBRATE_REPEAT 
+              , ctx->stats.l2d_refill / CALIBRATE_REPEAT );
+    __perf_reset_stats(ctx);
+
+
+    /* run the full ubenchmark */
 
     flush_tlb(ctx);
 
@@ -335,13 +379,29 @@ run_bench(struct eval_context* ctx)
     __perf_reset_stats(ctx);
 }
 
+static void
+cleanup(struct eval_context* ctx)
+{
+    close(ctx->tlbi_fd);
+    close(ctx->pmu_cycles);
+    close(ctx->pmu_l1rf);
+    close(ctx->pmu_l2rf);
+
+    int pgsz = sysconf(_SC_PAGESIZE);
+    
+    for (int i = 0; i < MAX_SCATTER; i++)
+    {
+        munmap((void*)ctx->p_locs[i], pgsz);
+    }
+}
+
 int no_optimize
 main(int argc, char** argv)
 {
     struct eval_param param;
     struct eval_context* ctx;
 
-    srand(time(NULL));
+    srand(0);
     __parse_args(&param, argc, argv);
 
     ctx = __create_context(&param);
@@ -351,4 +411,5 @@ main(int argc, char** argv)
         run_bench(ctx);
     }
     
+    cleanup(ctx);
 }

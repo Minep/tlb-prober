@@ -1,2 +1,4 @@
 evaluate
 result.*
+*.png
+.*/
