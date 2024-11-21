@@ -1,3 +1,3 @@
 #!/bin/bash
 
-sudo chrt -r 99 taskset -c 0 ./evaluate --cpu 0 --samples 30 --scatter 64 > result.txt
+sudo taskset -c 3 chrt --rr 99 ./evaluate --cpu 3 --samples 32 --scatter 64 > result.txt

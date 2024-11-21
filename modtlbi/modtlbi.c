@@ -4,6 +4,8 @@
 #include <linux/module.h> 
 #include <linux/string.h> 
 #include <linux/sysfs.h> 
+
+// #define DEBUG
  
 static struct kobject *modtlbi; 
  
@@ -12,6 +14,16 @@ static ssize_t tlbi_show(struct kobject *kobj,
 { 
     return 0; 
 } 
+
+static inline void
+__tlbi(void)
+{
+    asm volatile (
+        "tlbi vmalle1\n"
+        "dsb sy\n"
+        "isb\n"
+    );
+}
 
 static inline void
 __tlbi(void)
@@ -39,14 +51,19 @@ static ssize_t tlbi_store(struct kobject *kobj,
                                 size_t count) 
 {
     if (!strcmp(buf, "all")) {
+#ifdef DEBUG
         pr_info("modtlbi: flush all\n"); 
+#endif
         __tlbi();
         return count;
     }
 
     unsigned long va;
     sscanf(buf, "%lx", &va); 
+
+#ifdef DEBUG
     pr_info("modtlbi: flush va:0x%lx\n", va); 
+#endif
 
     __tlbi_va(va);
 

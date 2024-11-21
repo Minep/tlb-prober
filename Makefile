@@ -9,4 +9,4 @@ all:
 	$(CC) evaluate.c -o evaluate
 
 clean:
-	@rm evaluate
+	@rm -f evaluate
