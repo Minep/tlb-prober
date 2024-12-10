@@ -8,5 +8,8 @@ modtlbi:
 all:
 	$(CC) evaluate.c -o evaluate
 
+install:
+	@sudo insmod modtlbi/modtlbi.ko
+
 clean:
 	@rm -f evaluate

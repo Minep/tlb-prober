@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <time.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -12,20 +13,23 @@
 #include <sys/ioctl.h>
 #include <linux/perf_event.h>
 
-#include "primes.h"
-
 #define FLUSH_ALL_CMD "all"
-#define MAX_SCATTER     512
 
-#define SCATTERS_RANGE  8
+#define NR_DTLB_ENTRIES 224
+#define NR_DTLB_WAYS    7
+
+#define NR_SETS     256
+#define NR_BLKSZ    64
+#define NR_REGIONS  (512)
+
 #define READ_BUFFER_SZ  4096
-#define MIN_SCATTER     8
 
 #define PMU_CPU_CYCLES          0x0011
 #define PMU_L2D_TLB_REFILL      0x002d 
 #define PMU_L1D_TLB_REFILL      0x0005
 #define MAP_OPTS                (MAP_ANONYMOUS | MAP_PRIVATE | MAP_POPULATE)
 #define true 1
+
 #define no_optimize             __attribute__((optimize("O0")))
 #define force_inline            __attribute__((always_inline))
 
@@ -39,9 +43,8 @@
         ret;                                                \
     })
 
-
-#define log(type, cycle, l1, l2)    \
-        printf(#type ",%llu,%llu,%llu\n", cycle, l1, l2)
+#define log(type, nr_i, cycle, l1, l2)    \
+        printf(#type ",%u,%llu,%llu,%llu\n", nr_i, cycle, l1, l2)
 
 typedef unsigned long ptr_t;
 
@@ -67,13 +70,20 @@ struct eval_param
     int nr_scatter;
 };
 
+struct pmu_stats {
+    unsigned long long cycles;
+    unsigned long long l1d_refill;
+    unsigned long long l2d_refill;
+};
+
 struct eval_context
 {
     union {
-        int** c_locs;
-        ptr_t* p_locs;
+        volatile int** c_locs;
+        volatile ptr_t* p_locs;
     };
 
+    int start, expect_nr_insts;
     struct eval_param param;
     
     struct {
@@ -83,14 +93,10 @@ struct eval_context
         int pmu_l1rf;
     };
 
-    struct {
-        unsigned long long cycles;
-        unsigned long long l1d_refill;
-        unsigned long long l2d_refill;
-    } stats;
+    struct pmu_stats stats;
 };
 
-static void 
+static inline void 
 flush_tlb(struct eval_context* ctx)
 {
     write(ctx->tlbi_fd, FLUSH_ALL_CMD, sizeof(FLUSH_ALL_CMD));
@@ -115,36 +121,15 @@ __parse_args(struct eval_param* param, int argc, char** argv)
     struct option opts[] = {
         {"cpu", required_argument, 0, 'c'},
         {"samples", required_argument, 0, 'n'},
-        {"scatter", required_argument, 0, 's'},
         {0, 0, 0, 0} // Terminator
     };
     
-    while ((c = getopt_long(argc, argv, "c:n:s:", opts, &opti)) != 255)
+    while ((c = getopt_long(argc, argv, "c:n:", opts, &opti)) != 255)
     {
         switch (c)
         {
             case 'c':
                 param->affinity = atoi(optarg);
-            break;
-
-            case 's':
-            {
-                int nr = atoi(optarg);
-                if (nr < 0) {
-                    printf("invalid scatter count: %d\n", nr);
-                    exit(1);
-                }
-
-                if (nr > MAX_SCATTER) {
-                    nr = MAX_SCATTER;
-                }
-
-                if (nr < MIN_SCATTER) {
-                    nr = MIN_SCATTER;
-                }
-
-                param->nr_scatter = nr;
-            }
             break;
 
             case 'n':
@@ -159,32 +144,85 @@ __parse_args(struct eval_param* param, int argc, char** argv)
     }
 }
 
-#define abs(x)  (x < 0 ? -x : x)
-#define sgn(x)  (x < 0 ? -1 : 1)
+static ptr_t
+__setup_region(struct eval_context* ctx, ptr_t va, int pgsz)
+{
+    ptr_t next = 5;
+    int nr_ents = pgsz / NR_BLKSZ;
+    char* v = (char*)va;
+    
+    for (int i = 0; i < nr_ents - 1; i++) {
+        *(int*)(&v[i * NR_BLKSZ]) = i + 1;
+    }
+
+    *(int*)(&v[(nr_ents - 1) * NR_BLKSZ]) = 0;
+    for (int i = 0; i < nr_ents; i++) {
+        next = next * 1664525UL + 1013904223UL;
+        unsigned int r = next % (nr_ents);
+        int j = *(int*)(&v[r * NR_BLKSZ]);
+        *(int*)(&v[r * NR_BLKSZ]) = *(int*)(&v[i * NR_BLKSZ]);
+        *(int*)(&v[i * NR_BLKSZ]) = j;
+    }
+
+    for (int i = 0; i < nr_ents - 1; i++) {
+        if (*(int*)(&v[i * NR_BLKSZ]) == 1) {
+            ctx->start = i;
+            break;
+        }
+    }
+
+    int off = ctx->start, i = 0;
+    do {
+        off = *(int*)&v[off * NR_BLKSZ];
+        i++;
+    } while (off);
+    
+    ctx->expect_nr_insts = i;
+
+    return (ptr_t)v;
+}
 
 static void
 __prepare_regions(struct eval_context* ctx)
 {
-    ptr_t va = 0, start = 0;
+    ptr_t va = 0;
     int pgsz = sysconf(_SC_PAGESIZE);
-    int scatter = MAX_SCATTER;
-    int rand_off;
-    int opts = MAP_OPTS;
+    ptr_t next = 12;
+    int dtlb_sets = NR_DTLB_ENTRIES / NR_DTLB_WAYS;
 
-    ctx->p_locs = (ptr_t*)calloc(sizeof(ptr_t), scatter);
+    ctx->p_locs = ensure(mmap, (void*)va, NR_REGIONS * pgsz, PROT_WRITE, MAP_OPTS, 0, 0);
 
-    for (int i = 0; i < MAX_SCATTER; ++i)
+    for (int i = 0; i < NR_REGIONS; ++i)
     {
-        va = (ptr_t)ensure(mmap, (void*)va, pgsz, PROT_WRITE, opts, 0, 0);
-        log(loc, va, 0, 0);
+        va = __setup_region(ctx, va, pgsz);
         ctx->p_locs[i] = va;
-        
-        if (!start) {
-            start = va;
-        }
-
-        va = start + (primes[i] / 2) * pgsz;
+        next = next * 1664525UL + 1013904223UL;
+        va = va +  pgsz;
     }
+}
+
+static inline int force_inline
+__run_bench(struct eval_context* ctx, int i)
+{
+    register int off = ctx->start;
+    register char* arr = (char*)ctx->p_locs[i];
+
+    do {
+        off = *(int*)(&arr[off * NR_BLKSZ]);
+    } while(off);
+}
+
+static inline int force_inline
+__run_bench_skip_table(struct eval_context* ctx)
+{
+    register int off = ctx->start;
+    register int i = 0;
+    char* arr = (char*)ctx->p_locs[i];
+
+    do {
+        off = *(int*)(&arr[off * NR_BLKSZ]);
+        arr = (char*)ctx->p_locs[++i];
+    } while(off);
 }
 
 static struct eval_context*
@@ -222,14 +260,6 @@ __create_context(struct eval_param* param)
     
     return ctx;
 }
-
-
-#define BENCH_BODY(arr, scatter, repeat)                        \
-    do {                                                        \
-        for (register int i = 0; i < repeat * scatter; ++i) {   \
-            *arr[i % scatter] = i;                              \
-        }                                                       \
-    } while(0)
 
 static inline void force_inline
 __perf_begin(struct eval_context* ctx)
@@ -281,102 +311,99 @@ __perf_reset_stats(struct eval_context* ctx)
     ctx->stats.l2d_refill = 0ULL;
 }
 
-#define CALIBRATE_REPEAT      10
+static void no_optimize
+__run_dtlb_bench(struct eval_context* ctx)
+{
+    register volatile int a;
+    struct pmu_stats base, nomiss, l1miss;
+    flush_tlb(ctx);
+
+    // warm up
+    perf(ctx, { });
+
+    // correction for noise
+    perf(ctx, { });
+    __perf_collect(ctx);
+    
+    log(overhead, 0
+            , ctx->stats.cycles    
+            , ctx->stats.l1d_refill
+            , ctx->stats.l2d_refill);
+    base = ctx->stats;
+    
+    __perf_reset_stats(ctx);
+
+    flush_tlb(ctx);
+
+    // warm up
+    perf(ctx, {
+        __run_bench_skip_table(ctx);
+    });
+    
+    // no miss
+    perf(ctx, {
+        __run_bench_skip_table(ctx);
+    });
+    __perf_collect(ctx);
+    
+    log(no_miss , ctx->expect_nr_insts
+                , ctx->stats.cycles
+                , ctx->stats.l1d_refill
+                , ctx->stats.l2d_refill);
+                
+    nomiss = ctx->stats;
+    __perf_reset_stats(ctx);
+
+    // l1 miss
+    
+    perf(ctx, {
+        __run_bench_skip_table(ctx);
+    });
+
+    flush_tlb(ctx);
+
+    for (int i = 0; i < NR_REGIONS; i++) {
+        a = *ctx->c_locs[i];
+    }
+
+    perf(ctx, {
+        __run_bench_skip_table(ctx);
+    });
+    __perf_collect(ctx);
+
+    log(l1miss, ctx->expect_nr_insts
+              , ctx->stats.cycles
+              , ctx->stats.l1d_refill
+              , ctx->stats.l2d_refill);
+
+    l1miss = ctx->stats;
+    __perf_reset_stats(ctx);
+
+
+    double tick_pmu, tick_nomiss, tick_l1miss, tick_mmu;
+    double tick_l1lat, tick_l2lat, tick_mmu_tot;
+    double n_l1, compensate, l1l2;
+    
+    tick_pmu = (double)base.cycles;
+    tick_nomiss = (double)nomiss.cycles;
+    tick_l1miss = (double)l1miss.cycles;
+
+    n_l1 = ctx->expect_nr_insts - l1miss.l1d_refill;
+    tick_nomiss = (tick_nomiss - tick_pmu) / ctx->expect_nr_insts;
+    tick_l1miss = (tick_l1miss - tick_pmu) - tick_nomiss * n_l1;
+    tick_l1miss = tick_l1miss / l1miss.l1d_refill;
+    tick_mmu = tick_l1miss - tick_nomiss;
+
+    printf("lat-note, inst, iex+lsu, l2_hit\n");
+    printf("lat     ,%0.2lf,%0.2lf,%0.2lf\n", 
+            tick_l1miss, tick_nomiss, tick_mmu);
+}
 
 static void no_optimize
 run_bench(struct eval_context* ctx)
 {
-    register int repeat, scatter;
-    register volatile int** arr;
-    
-    repeat  = ctx->param.sample_cnt;
-    scatter = ctx->param.nr_scatter;
-    arr     = (volatile int**)ctx->c_locs;
-
-    flush_tlb(ctx);
-
-    // warm up
-    perf(ctx, {
-        BENCH_BODY(arr, MIN_SCATTER, 1);
-    });
-
-    // correction for noise
-    for (register int i = 0; i < CALIBRATE_REPEAT; i++)
-    {
-        perf(ctx, {
-            
-        });
-        __perf_collect(ctx);
-    }
-    
-    log(base, ctx->stats.cycles     / CALIBRATE_REPEAT
-            , ctx->stats.l1d_refill / CALIBRATE_REPEAT
-            , ctx->stats.l2d_refill / CALIBRATE_REPEAT);
-    
-    __perf_reset_stats(ctx);
-
-
-    flush_tlb(ctx);
-
-    // warm up
-    perf(ctx, {
-        BENCH_BODY(arr, MIN_SCATTER, 1);
-    });
-
-    // correction for noise
-    for (register int i = 0; i < CALIBRATE_REPEAT; i++)
-    {
-        perf(ctx, {
-            BENCH_BODY(arr, MIN_SCATTER, 1);
-        });
-        __perf_collect(ctx);
-    }
-    
-    log(no_miss, ctx->stats.cycles  / CALIBRATE_REPEAT
-            , MIN_SCATTER
-            , 0);
-    
-    __perf_reset_stats(ctx);
-
-
-    /* collect latency of l1 miss but l2 hit.*/
-
-    for (register int i = 0; i < CALIBRATE_REPEAT; i++)
-    {
-        flush_tlb(ctx);
-
-        // warm up
-        perf(ctx, {
-            BENCH_BODY(arr, MAX_SCATTER, 2);
-        });
-
-        perf(ctx, {
-            BENCH_BODY(arr, MIN_SCATTER, 1);
-        });
-        __perf_collect(ctx);
-    }
-
-    log(l1miss, ctx->stats.cycles / CALIBRATE_REPEAT
-              , ctx->stats.l1d_refill / CALIBRATE_REPEAT 
-              , ctx->stats.l2d_refill / CALIBRATE_REPEAT );
-    __perf_reset_stats(ctx);
-
-
-    /* run the full ubenchmark */
-
-    flush_tlb(ctx);
-
-    perf(ctx, { });     // warm up the tlb path for syscalls
-
-    perf(ctx, {
-        BENCH_BODY(arr, scatter, 1);
-    });
-
-    __perf_collect(ctx);
-    log(eval  , ctx->stats.cycles
-              , ctx->stats.l1d_refill
-              , ctx->stats.l2d_refill);
-    __perf_reset_stats(ctx);
+    srand(0);
+    __run_dtlb_bench(ctx);
 }
 
 static void
@@ -389,7 +416,7 @@ cleanup(struct eval_context* ctx)
 
     int pgsz = sysconf(_SC_PAGESIZE);
     
-    for (int i = 0; i < MAX_SCATTER; i++)
+    for (int i = 0; i < NR_SETS; i++)
     {
         munmap((void*)ctx->p_locs[i], pgsz);
     }
