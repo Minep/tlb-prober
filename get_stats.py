@@ -14,9 +14,6 @@ for file in files:
             stats.append([float(inst), float(iex), float(l2hit)])
     
 
-A = np.asarray(stats)
-print("inst",  np.median(A[:,0]))
-print("iex/lsu",   np.median(A[:,1]))
-print("l2hit", np.median(A[:,2]))
-
+A = np.asarray(stats).reshape((-1, 3))
+print(np.median(A[:,0]), np.median(A[:,1]), np.median(A[:,2]))
 

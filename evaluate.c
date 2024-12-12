@@ -14,14 +14,9 @@
 #include <sys/ioctl.h>
 #include <linux/perf_event.h>
 
+#include "config.h"
+
 #define FLUSH_ALL_CMD "all"
-
-#define NR_DTLB_ENTRIES 224
-#define NR_DTLB_WAYS    7
-
-#define NR_SETS     256
-#define NR_BLKSZ    64
-#define NR_REGIONS  (NR_DTLB_ENTRIES * 2)
 
 #define READ_BUFFER_SZ  4096
 
@@ -101,12 +96,6 @@ struct eval_context
 
     struct pmu_stats stats;
 };
-
-static inline void 
-flush_tlb(struct eval_context* ctx)
-{
-    write(ctx->tlbi_fd, FLUSH_ALL_CMD, sizeof(FLUSH_ALL_CMD));
-}
 
 static int
 perf_event_open(struct perf_event_attr* evt, 
@@ -199,9 +188,9 @@ __setup_page_seq(ptr_t seed, int num, int with_cacheline)
     ensure(madvise, region, sz, MADV_UNMERGEABLE | MADV_NOHUGEPAGE);
 
     int index = 0;
-    int blksz = !with_cacheline ? 0 : NR_BLKSZ;
+    int blksz = !with_cacheline ? 0 : L1DCACHE_LINES;
     ptr_t off = 0;
-    nr_slot   = pgsz / NR_BLKSZ;
+    nr_slot   = pgsz / L1DCACHE_LINES;
     for (int i = 0; i < num; i++)
     {
         index = chain[i];
@@ -235,7 +224,6 @@ __create_context(struct eval_param* param)
     ctx = calloc(1, sizeof(*ctx));
 
     ctx->param   = *param;
-    ctx->tlbi_fd = ensure(open, "/sys/kernel/tlbi/tlbi", O_RDWR);
 
     struct perf_event_attr evt;
     memset(&evt, 0, sizeof(evt));
@@ -406,8 +394,8 @@ __run_tlb_bench(struct eval_context* ctx)
 }
 #else
 
-#define NR_ACCESS (64)
-#define NR_SCRAP  (NR_DTLB_ENTRIES * NR_DTLB_WAYS)
+#define NR_ACCESS (L1DTLB_ENTRIES / 2)
+#define NR_SCRAP  (L1DTLB_ENTRIES * L1DTLB_WAYS)
 
 static void no_optimize
 __run_tlb_bench(struct eval_context* ctx)
@@ -418,7 +406,7 @@ __run_tlb_bench(struct eval_context* ctx)
     int valid = 1;
 
     scrap = __setup_page_seq(11, NR_SCRAP, true);
-    data = __setup_page_seq(43, NR_DTLB_ENTRIES, 0);
+    data = __setup_page_seq(43, L1DTLB_ENTRIES, 0);
     data_small = __setup_page_seq(97, NR_ACCESS, true);
 
     __run_bench(scrap);
@@ -511,7 +499,6 @@ run_bench(struct eval_context* ctx)
 static void
 cleanup(struct eval_context* ctx)
 {
-    close(ctx->tlbi_fd);
     close(ctx->pmu_cycles);
     close(ctx->pmu_l1rf);
     close(ctx->pmu_l2rf);

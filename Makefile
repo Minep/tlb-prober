@@ -39,4 +39,11 @@ install:
 	@sudo insmod modtlbi/modtlbi.ko
 
 clean:
-	@rm -f evaluate evaluate_jmp jump_table_*.S jump_table_*.ldx link.ld $(OBJS)
+	@rm -f evaluate evaluate_jmp jump_table_*.S jump_table_*.ldx link.ld config.h $(OBJS) $(OBJS_JMP)
+
+
+run_dtlb:
+	@./subrun.sh evaluate | ./aggregate.py
+
+run_itlb:
+	@./subrun.sh evaluate_jmp | ./aggregate.py
