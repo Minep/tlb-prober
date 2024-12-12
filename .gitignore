@@ -7,3 +7,4 @@ result.*
 *.o
 jump_table_*
 *.ld
+results/
