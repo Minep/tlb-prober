@@ -1,0 +1,6 @@
+SECTIONS {
+    #include "jump_table_small.ldx"
+    #include "jump_table_fit.ldx"
+    #include "jump_table_scrap.ldx"
+}
+INSERT AFTER .text

@@ -1,4 +1,9 @@
 evaluate
+evaluate_jmp
 result.*
 *.png
 .*/
+
+*.o
+jump_table_*
+*.ld

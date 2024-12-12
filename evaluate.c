@@ -7,6 +7,7 @@
 #include <getopt.h>
 #include <errno.h>
 #include <string.h>
+#include <time.h>
 
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -15,12 +16,12 @@
 
 #define FLUSH_ALL_CMD "all"
 
-#define NR_DTLB_ENTRIES 224
-#define NR_DTLB_WAYS    7
+#define NR_DTLB_ENTRIES 48
+#define NR_DTLB_WAYS    1
 
 #define NR_SETS     256
 #define NR_BLKSZ    64
-#define NR_REGIONS  (512)
+#define NR_REGIONS  (NR_DTLB_ENTRIES * 2)
 
 #define READ_BUFFER_SZ  4096
 
@@ -144,84 +145,73 @@ __parse_args(struct eval_param* param, int argc, char** argv)
     }
 }
 
-static ptr_t
-__setup_region(struct eval_context* ctx, ptr_t va, int pgsz)
+static int*
+__generate_rand_chain(ptr_t seed, int num)
 {
-    ptr_t next = 5;
-    int nr_ents = pgsz / NR_BLKSZ;
-    char* v = (char*)va;
-    
-    for (int i = 0; i < nr_ents - 1; i++) {
-        *(int*)(&v[i * NR_BLKSZ]) = i + 1;
+    unsigned long next = seed;
+    int seqi_len = num - 1;
+    int* arr = calloc(sizeof(int), seqi_len);
+    int* chain = calloc(sizeof(int), num);
+
+    for (int i = 0; i < seqi_len; i++) {
+        arr[i] = i + 1;
     }
 
-    *(int*)(&v[(nr_ents - 1) * NR_BLKSZ]) = 0;
-    for (int i = 0; i < nr_ents; i++) {
+    for (int i = 0; i < seqi_len; i++) {
         next = next * 1664525UL + 1013904223UL;
-        unsigned int r = next % (nr_ents);
-        int j = *(int*)(&v[r * NR_BLKSZ]);
-        *(int*)(&v[r * NR_BLKSZ]) = *(int*)(&v[i * NR_BLKSZ]);
-        *(int*)(&v[i * NR_BLKSZ]) = j;
+        int r = next % (seqi_len);
+        int k = arr[i];
+
+        arr[i] = arr[r];
+        arr[r] = k;
     }
 
-    for (int i = 0; i < nr_ents - 1; i++) {
-        if (*(int*)(&v[i * NR_BLKSZ]) == 1) {
-            ctx->start = i;
-            break;
-        }
+    int j = 0;
+    for (int i = 0; i < seqi_len; i++) {
+        chain[j] = arr[i];
+        j = arr[i];
     }
 
-    int off = ctx->start, i = 0;
-    do {
-        off = *(int*)&v[off * NR_BLKSZ];
-        i++;
-    } while (off);
-    
-    ctx->expect_nr_insts = i;
+    chain[j] = 0;
+    free(arr);
 
-    return (ptr_t)v;
+    return chain;
 }
 
-static void
-__prepare_regions(struct eval_context* ctx)
+static char*
+__setup_page_seq(ptr_t seed, int num, int with_cacheline)
 {
-    ptr_t va = 0;
-    int pgsz = sysconf(_SC_PAGESIZE);
-    ptr_t next = 12;
-    int dtlb_sets = NR_DTLB_ENTRIES / NR_DTLB_WAYS;
+    int pgsz, *chain, nr_slot;
+    char *region;
 
-    ctx->p_locs = ensure(mmap, (void*)va, NR_REGIONS * pgsz, PROT_WRITE, MAP_OPTS, 0, 0);
+    pgsz = sysconf(_SC_PAGESIZE);
+    chain = __generate_rand_chain(seed, num);
 
-    for (int i = 0; i < NR_REGIONS; ++i)
+    region = (char*)ensure(mmap, NULL, num * pgsz, PROT_WRITE, MAP_OPTS, 0, 0);
+
+    int index = 0;
+    int blksz = !with_cacheline ? 0 : NR_BLKSZ;
+    ptr_t off = 0;
+    nr_slot   = pgsz / NR_BLKSZ;
+    for (int i = 0; i < num; i++)
     {
-        va = __setup_region(ctx, va, pgsz);
-        ctx->p_locs[i] = va;
-        next = next * 1664525UL + 1013904223UL;
-        va = va +  pgsz;
+        index = chain[i];
+        off   = index % nr_slot;
+        off   = off * blksz + index * pgsz;
+        
+        *(ptr_t*)(&region[i * pgsz + (i % nr_slot) * blksz]) = off;
     }
+    
+    free(chain);
+    return region;
 }
 
 static inline int force_inline
-__run_bench(struct eval_context* ctx, int i)
+__run_bench(char* arr)
 {
-    register int off = ctx->start;
-    register char* arr = (char*)ctx->p_locs[i];
-
+    register ptr_t off = 0;
     do {
-        off = *(int*)(&arr[off * NR_BLKSZ]);
-    } while(off);
-}
-
-static inline int force_inline
-__run_bench_skip_table(struct eval_context* ctx)
-{
-    register int off = ctx->start;
-    register int i = 0;
-    char* arr = (char*)ctx->p_locs[i];
-
-    do {
-        off = *(int*)(&arr[off * NR_BLKSZ]);
-        arr = (char*)ctx->p_locs[++i];
+        off = *(ptr_t*)(&arr[off]);
     } while(off);
 }
 
@@ -233,9 +223,7 @@ __create_context(struct eval_param* param)
     ctx = calloc(1, sizeof(*ctx));
 
     ctx->param   = *param;
-    ctx->tlbi_fd = ensure(open, "/sys/kernel/tlbi/tlbi", O_RDWR);
-
-    __prepare_regions(ctx);
+    //ctx->tlbi_fd = ensure(open, "/sys/kernel/tlbi/tlbi", O_RDWR);
 
     struct perf_event_attr evt;
     memset(&evt, 0, sizeof(evt));
@@ -253,10 +241,10 @@ __create_context(struct eval_param* param)
     evt.pinned = 0;
     evt.type        = PERF_TYPE_RAW;
     evt.config      = PMU_L2D_TLB_REFILL;
-    ctx->pmu_l2rf   = perf_event_open(&evt, getpid(), param->affinity, ctx->pmu_cycles, 0);
+    ctx->pmu_l2rf   = perf_event_open(&evt, getpid(), param->affinity, -1, 0);
 
     evt.config      = PMU_L1D_TLB_REFILL;
-    ctx->pmu_l1rf   = perf_event_open(&evt, getpid(), param->affinity, ctx->pmu_cycles, 0);
+    ctx->pmu_l1rf   = perf_event_open(&evt, getpid(), param->affinity, -1, 0);
     
     return ctx;
 }
@@ -265,8 +253,8 @@ static inline void force_inline
 __perf_begin(struct eval_context* ctx)
 {
     ioctl(ctx->pmu_cycles, PERF_EVENT_IOC_RESET, 0);
-    ioctl(ctx->pmu_l1rf, PERF_EVENT_IOC_RESET, 0);
     ioctl(ctx->pmu_l2rf, PERF_EVENT_IOC_RESET, 0);
+    ioctl(ctx->pmu_l1rf, PERF_EVENT_IOC_RESET, 0);
 
     ioctl(ctx->pmu_l1rf, PERF_EVENT_IOC_ENABLE, 0);
     ioctl(ctx->pmu_l2rf, PERF_EVENT_IOC_ENABLE, 0);
@@ -296,13 +284,6 @@ __perf_collect(struct eval_context* ctx)
     ctx->stats.l2d_refill += buf.result.value;
 }
 
-#define perf(ctx, body)      \
-    do {                     \
-        __perf_begin(ctx);   \
-        body;                \
-        __perf_end(ctx);     \
-    } while(0)
-
 static inline void
 __perf_reset_stats(struct eval_context* ctx)
 {
@@ -311,12 +292,28 @@ __perf_reset_stats(struct eval_context* ctx)
     ctx->stats.l2d_refill = 0ULL;
 }
 
+#define perf(ctx, body)      \
+    do {                     \
+        __perf_begin(ctx);   \
+        body;                \
+        __perf_end(ctx);     \
+    } while(0)
+
+#define NR_ACCESS (NR_DTLB_ENTRIES / 2)
+#define NR_SCRAP  (NR_DTLB_ENTRIES * NR_DTLB_WAYS * 2)
+
 static void no_optimize
 __run_dtlb_bench(struct eval_context* ctx)
 {
-    register volatile int a;
+    register char *data, *data_small, *scrap;
+    register int pgsz = sysconf(_SC_PAGESIZE);
     struct pmu_stats base, nomiss, l1miss;
-    flush_tlb(ctx);
+
+    scrap = __setup_page_seq(11, NR_SCRAP, 0);
+    data = __setup_page_seq(43, NR_DTLB_ENTRIES, 0);
+    data_small = __setup_page_seq(97, NR_ACCESS, true);
+
+    __run_bench(scrap);
 
     // warm up
     perf(ctx, { });
@@ -333,45 +330,41 @@ __run_dtlb_bench(struct eval_context* ctx)
     
     __perf_reset_stats(ctx);
 
-    flush_tlb(ctx);
-
     // warm up
     perf(ctx, {
-        __run_bench_skip_table(ctx);
+        __run_bench(data_small);
     });
     
     // no miss
     perf(ctx, {
-        __run_bench_skip_table(ctx);
+        __run_bench(data_small);
     });
     __perf_collect(ctx);
     
-    log(no_miss , ctx->expect_nr_insts
+    log(no_miss , NR_ACCESS
                 , ctx->stats.cycles
                 , ctx->stats.l1d_refill
                 , ctx->stats.l2d_refill);
-                
+
     nomiss = ctx->stats;
     __perf_reset_stats(ctx);
+
+    __run_bench(scrap);
 
     // l1 miss
     
     perf(ctx, {
-        __run_bench_skip_table(ctx);
+        __run_bench(data_small);
     });
 
-    flush_tlb(ctx);
-
-    for (int i = 0; i < NR_REGIONS; i++) {
-        a = *ctx->c_locs[i];
-    }
+    __run_bench(data);
 
     perf(ctx, {
-        __run_bench_skip_table(ctx);
+        __run_bench(data_small);
     });
     __perf_collect(ctx);
 
-    log(l1miss, ctx->expect_nr_insts
+    log(l1miss, NR_ACCESS
               , ctx->stats.cycles
               , ctx->stats.l1d_refill
               , ctx->stats.l2d_refill);
@@ -388,10 +381,9 @@ __run_dtlb_bench(struct eval_context* ctx)
     tick_nomiss = (double)nomiss.cycles;
     tick_l1miss = (double)l1miss.cycles;
 
-    n_l1 = ctx->expect_nr_insts - l1miss.l1d_refill;
-    tick_nomiss = (tick_nomiss - tick_pmu) / ctx->expect_nr_insts;
-    tick_l1miss = (tick_l1miss - tick_pmu) - tick_nomiss * n_l1;
-    tick_l1miss = tick_l1miss / l1miss.l1d_refill;
+    tick_nomiss = (tick_nomiss - tick_pmu) / NR_ACCESS;
+    tick_l1miss = (tick_l1miss - tick_pmu) / NR_ACCESS;
+
     tick_mmu = tick_l1miss - tick_nomiss;
 
     printf("lat-note, inst, iex+lsu, l2_hit\n");
@@ -402,24 +394,16 @@ __run_dtlb_bench(struct eval_context* ctx)
 static void no_optimize
 run_bench(struct eval_context* ctx)
 {
-    srand(0);
     __run_dtlb_bench(ctx);
 }
 
 static void
 cleanup(struct eval_context* ctx)
 {
-    close(ctx->tlbi_fd);
+    //close(ctx->tlbi_fd);
     close(ctx->pmu_cycles);
     close(ctx->pmu_l1rf);
     close(ctx->pmu_l2rf);
-
-    int pgsz = sysconf(_SC_PAGESIZE);
-    
-    for (int i = 0; i < NR_SETS; i++)
-    {
-        munmap((void*)ctx->p_locs[i], pgsz);
-    }
 }
 
 int no_optimize

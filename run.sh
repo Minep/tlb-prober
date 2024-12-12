@@ -1,11 +1,11 @@
 #!/bin/bash
 
-RUNS=1
+RUNS=10
 CPU=3
 
-for ((nr=0, nr <= $RUNS, nr++)); do
+for ((nr=0; nr < $RUNS; nr++)); do
+    echo "run" $nr
     sudo chrt --rr 99 taskset -c $CPU ./evaluate --cpu $CPU --samples 1 > result.$nr.txt
-    sleep 2
 done
 
 
