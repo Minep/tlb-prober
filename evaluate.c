@@ -16,8 +16,8 @@
 
 #define FLUSH_ALL_CMD "all"
 
-#define NR_DTLB_ENTRIES 48
-#define NR_DTLB_WAYS    1
+#define NR_DTLB_ENTRIES 224
+#define NR_DTLB_WAYS    7
 
 #define NR_SETS     256
 #define NR_BLKSZ    64
@@ -26,9 +26,14 @@
 #define READ_BUFFER_SZ  4096
 
 #define PMU_CPU_CYCLES          0x0011
-#define PMU_L2D_TLB_REFILL      0x002d 
-#define PMU_L1D_TLB_REFILL      0x0005
-#define MAP_OPTS                (MAP_ANONYMOUS | MAP_PRIVATE | MAP_POPULATE)
+#ifdef ITLB_BENCH
+#define PMU_L2_TLB_REFILL       0x002d 
+#define PMU_L1_TLB_REFILL       0x0002
+#else
+#define PMU_L2_TLB_REFILL       0x002d 
+#define PMU_L1_TLB_REFILL       0x0005
+#endif
+#define MAP_OPTS                (MAP_ANONYMOUS | MAP_PRIVATE)
 #define true 1
 
 #define no_optimize             __attribute__((optimize("O0")))
@@ -73,8 +78,8 @@ struct eval_param
 
 struct pmu_stats {
     unsigned long long cycles;
-    unsigned long long l1d_refill;
-    unsigned long long l2d_refill;
+    unsigned long long l1_refill;
+    unsigned long long l2_refill;
 };
 
 struct eval_context
@@ -183,11 +188,15 @@ __setup_page_seq(ptr_t seed, int num, int with_cacheline)
 {
     int pgsz, *chain, nr_slot;
     char *region;
+    int min_skip = 0, max_skip = 16, rand_skip = 0, prev_skip = 0;
+    unsigned long next = seed + 42;
 
     pgsz = sysconf(_SC_PAGESIZE);
     chain = __generate_rand_chain(seed, num);
 
-    region = (char*)ensure(mmap, NULL, num * pgsz, PROT_WRITE, MAP_OPTS, 0, 0);
+    unsigned long sz = num * pgsz;
+    region = (char*)ensure(mmap, NULL, sz, PROT_WRITE, MAP_OPTS, 0, 0);
+    ensure(madvise, region, sz, MADV_UNMERGEABLE | MADV_NOHUGEPAGE);
 
     int index = 0;
     int blksz = !with_cacheline ? 0 : NR_BLKSZ;
@@ -196,10 +205,13 @@ __setup_page_seq(ptr_t seed, int num, int with_cacheline)
     for (int i = 0; i < num; i++)
     {
         index = chain[i];
+        next = next * 1664525UL + 1013904223UL;
+        rand_skip = (next % min_skip) + min_skip;
+
         off   = index % nr_slot;
-        off   = off * blksz + index * pgsz;
+        off   = off * blksz + (index + min_skip) * pgsz;
         
-        *(ptr_t*)(&region[i * pgsz + (i % nr_slot) * blksz]) = off;
+        *(ptr_t*)(&region[(i + min_skip) * pgsz + (i % nr_slot) * blksz]) = off;
     }
     
     free(chain);
@@ -223,7 +235,7 @@ __create_context(struct eval_param* param)
     ctx = calloc(1, sizeof(*ctx));
 
     ctx->param   = *param;
-    //ctx->tlbi_fd = ensure(open, "/sys/kernel/tlbi/tlbi", O_RDWR);
+    ctx->tlbi_fd = ensure(open, "/sys/kernel/tlbi/tlbi", O_RDWR);
 
     struct perf_event_attr evt;
     memset(&evt, 0, sizeof(evt));
@@ -240,10 +252,10 @@ __create_context(struct eval_param* param)
 
     evt.pinned = 0;
     evt.type        = PERF_TYPE_RAW;
-    evt.config      = PMU_L2D_TLB_REFILL;
+    evt.config      = PMU_L2_TLB_REFILL;
     ctx->pmu_l2rf   = perf_event_open(&evt, getpid(), param->affinity, -1, 0);
 
-    evt.config      = PMU_L1D_TLB_REFILL;
+    evt.config      = PMU_L1_TLB_REFILL;
     ctx->pmu_l1rf   = perf_event_open(&evt, getpid(), param->affinity, -1, 0);
     
     return ctx;
@@ -278,18 +290,18 @@ __perf_collect(struct eval_context* ctx)
     ctx->stats.cycles += buf.result.value;
 
     ensure(read, ctx->pmu_l1rf, buf.tmp_buf,   READ_BUFFER_SZ);
-    ctx->stats.l1d_refill += buf.result.value;
+    ctx->stats.l1_refill += buf.result.value;
 
     ensure(read, ctx->pmu_l2rf, buf.tmp_buf,   READ_BUFFER_SZ);
-    ctx->stats.l2d_refill += buf.result.value;
+    ctx->stats.l2_refill += buf.result.value;
 }
 
 static inline void
 __perf_reset_stats(struct eval_context* ctx)
 {
     ctx->stats.cycles     = 0ULL;
-    ctx->stats.l1d_refill = 0ULL;
-    ctx->stats.l2d_refill = 0ULL;
+    ctx->stats.l1_refill = 0ULL;
+    ctx->stats.l2_refill = 0ULL;
 }
 
 #define perf(ctx, body)      \
@@ -299,17 +311,113 @@ __perf_reset_stats(struct eval_context* ctx)
         __perf_end(ctx);     \
     } while(0)
 
-#define NR_ACCESS (NR_DTLB_ENTRIES / 2)
-#define NR_SCRAP  (NR_DTLB_ENTRIES * NR_DTLB_WAYS * 2)
+#ifdef ITLB_BENCH
+
+#define NR_ACCESS (32)
+
+extern void do_jump_fit();
+extern void do_jump_small();
+extern void do_jump_scrap();
 
 static void no_optimize
-__run_dtlb_bench(struct eval_context* ctx)
+__run_tlb_bench(struct eval_context* ctx)
+{
+    register int pgsz = sysconf(_SC_PAGESIZE);
+    struct pmu_stats base, nomiss, l1miss;
+    int valid = 1;
+
+    do_jump_scrap();
+
+    // warm up
+    perf(ctx, { });
+
+    // correction for noise
+    perf(ctx, { });
+    __perf_collect(ctx);
+    
+    log(overhead, 0
+            , ctx->stats.cycles    
+            , ctx->stats.l1_refill
+            , ctx->stats.l2_refill);
+    base = ctx->stats;
+    
+    __perf_reset_stats(ctx);
+
+    // warm up
+    perf(ctx, {
+        do_jump_small();
+    });
+    
+    // no miss
+    perf(ctx, {
+        do_jump_small();
+    });
+    __perf_collect(ctx);
+    
+    log(no_miss , NR_ACCESS
+                , ctx->stats.cycles
+                , ctx->stats.l1_refill
+                , ctx->stats.l2_refill);
+    nomiss = ctx->stats;
+    valid = valid && !nomiss.l1_refill && !nomiss.l2_refill;
+    __perf_reset_stats(ctx);
+
+    do_jump_scrap();
+
+    // l1 miss
+    
+    perf(ctx, {
+        do_jump_small();
+    });
+
+    do_jump_fit();
+
+    perf(ctx, {
+        do_jump_small();
+    });
+    __perf_collect(ctx);
+
+    log(l1miss, NR_ACCESS
+              , ctx->stats.cycles
+              , ctx->stats.l1_refill
+              , ctx->stats.l2_refill);
+
+    l1miss = ctx->stats;
+    valid = valid && l1miss.l1_refill && !l1miss.l2_refill;
+    __perf_reset_stats(ctx);
+
+    double tick_pmu, tick_nomiss, tick_l1miss, tick_mmu;
+    double tick_l1lat, tick_l2lat, tick_mmu_tot;
+    double n_l1, compensate, l1l2;
+    
+    tick_pmu = (double)base.cycles;
+    tick_nomiss = (double)nomiss.cycles;
+    tick_l1miss = (double)l1miss.cycles;
+
+    n_l1 = NR_ACCESS - l1miss.l1_refill;
+    tick_nomiss = (tick_nomiss - tick_pmu) / NR_ACCESS;
+    tick_l1miss = (tick_l1miss - tick_pmu - n_l1 * tick_nomiss) / l1miss.l1_refill;
+
+    tick_mmu = tick_l1miss - tick_nomiss;
+
+    printf("lat-note, inst, iex+lsu, l2_hit, may_invl\n");
+    printf("lat     ,%0.2lf,%0.2lf,%0.2lf,%d\n", 
+            tick_l1miss, tick_nomiss, tick_mmu, !valid);
+}
+#else
+
+#define NR_ACCESS (64)
+#define NR_SCRAP  (NR_DTLB_ENTRIES * NR_DTLB_WAYS)
+
+static void no_optimize
+__run_tlb_bench(struct eval_context* ctx)
 {
     register char *data, *data_small, *scrap;
     register int pgsz = sysconf(_SC_PAGESIZE);
     struct pmu_stats base, nomiss, l1miss;
+    int valid = 1;
 
-    scrap = __setup_page_seq(11, NR_SCRAP, 0);
+    scrap = __setup_page_seq(11, NR_SCRAP, true);
     data = __setup_page_seq(43, NR_DTLB_ENTRIES, 0);
     data_small = __setup_page_seq(97, NR_ACCESS, true);
 
@@ -324,8 +432,8 @@ __run_dtlb_bench(struct eval_context* ctx)
     
     log(overhead, 0
             , ctx->stats.cycles    
-            , ctx->stats.l1d_refill
-            , ctx->stats.l2d_refill);
+            , ctx->stats.l1_refill
+            , ctx->stats.l2_refill);
     base = ctx->stats;
     
     __perf_reset_stats(ctx);
@@ -343,10 +451,10 @@ __run_dtlb_bench(struct eval_context* ctx)
     
     log(no_miss , NR_ACCESS
                 , ctx->stats.cycles
-                , ctx->stats.l1d_refill
-                , ctx->stats.l2d_refill);
-
+                , ctx->stats.l1_refill
+                , ctx->stats.l2_refill);
     nomiss = ctx->stats;
+    valid = valid && !nomiss.l1_refill && !nomiss.l2_refill;
     __perf_reset_stats(ctx);
 
     __run_bench(scrap);
@@ -366,10 +474,11 @@ __run_dtlb_bench(struct eval_context* ctx)
 
     log(l1miss, NR_ACCESS
               , ctx->stats.cycles
-              , ctx->stats.l1d_refill
-              , ctx->stats.l2d_refill);
+              , ctx->stats.l1_refill
+              , ctx->stats.l2_refill);
 
     l1miss = ctx->stats;
+    valid = valid && l1miss.l1_refill && !l1miss.l2_refill;
     __perf_reset_stats(ctx);
 
 
@@ -381,26 +490,28 @@ __run_dtlb_bench(struct eval_context* ctx)
     tick_nomiss = (double)nomiss.cycles;
     tick_l1miss = (double)l1miss.cycles;
 
+    n_l1 = NR_ACCESS - l1miss.l1_refill;
     tick_nomiss = (tick_nomiss - tick_pmu) / NR_ACCESS;
-    tick_l1miss = (tick_l1miss - tick_pmu) / NR_ACCESS;
+    tick_l1miss = (tick_l1miss - tick_pmu - n_l1 * tick_nomiss) / l1miss.l1_refill;
 
     tick_mmu = tick_l1miss - tick_nomiss;
 
-    printf("lat-note, inst, iex+lsu, l2_hit\n");
-    printf("lat     ,%0.2lf,%0.2lf,%0.2lf\n", 
-            tick_l1miss, tick_nomiss, tick_mmu);
+    printf("lat-note, inst, iex+lsu, l2_hit, may_invl\n");
+    printf("lat     ,%0.2lf,%0.2lf,%0.2lf,%d\n", 
+            tick_l1miss, tick_nomiss, tick_mmu, !valid);
 }
+#endif
 
 static void no_optimize
 run_bench(struct eval_context* ctx)
 {
-    __run_dtlb_bench(ctx);
+    __run_tlb_bench(ctx);
 }
 
 static void
 cleanup(struct eval_context* ctx)
 {
-    //close(ctx->tlbi_fd);
+    close(ctx->tlbi_fd);
     close(ctx->pmu_cycles);
     close(ctx->pmu_l1rf);
     close(ctx->pmu_l2rf);

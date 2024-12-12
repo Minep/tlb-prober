@@ -7,11 +7,13 @@ if [ ! -d "$RESULT_DIR" ]; then
 fi
 
 RUNS=100
-CPU=3
+CPU=11
+
+PROG=${1:-evaluate}
 
 for ((nr=0; nr < $RUNS; nr++)); do
-    echo "run" $nr
-    sudo chrt --rr 99 taskset -c $CPU ./evaluate --cpu $CPU --samples 1 > $RESULT_DIR/result.$nr.txt
+    #echo "run" $nr
+    sudo chrt --rr 99 taskset -c $CPU ./$PROG --cpu $CPU --samples 1 > $RESULT_DIR/result.$nr.txt
 done
 
 

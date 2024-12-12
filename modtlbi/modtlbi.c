@@ -26,16 +26,6 @@ __tlbi(void)
 }
 
 static inline void
-__tlbi(void)
-{
-    asm volatile (
-        "tlbi vmalle1\n"
-        "dsb sy\n"
-        "isb\n"
-    );
-}
-
-static inline void
 __tlbi_va(unsigned long va)
 {
     asm volatile (

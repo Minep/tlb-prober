@@ -12,11 +12,15 @@ class JumpSlot:
         self.label = f"j_{disambig}_{index}"
         self.to_label = f"j_{disambig}_{to}"
         self.__to = to
+        self.rand_align = PAGE_SIZE * random.randint(8,16)
 
-        self.__nr_pads = PAGE_SIZE // cache_line
+        if cache_line:
+            __nr_pads = PAGE_SIZE // cache_line
 
-        n = index % self.__nr_pads
-        self.__pads = ["0"] * (n * cache_line // 4)
+            n = index % __nr_pads
+            self.__pads = ["0"] * (n * cache_line // 4)
+        else:
+            self.__pads = [ "0" ]
 
     def get_insts(self):
         if not self.__to:
@@ -34,7 +38,7 @@ class JumpSlot:
     
     def emit_ld(self):
         return "\n".join([
-            f"{self.section} BLOCK(4K):",
+            f"{self.section} ALIGN({self.rand_align}):",
             "{",
             f"    *({self.section});",
             "}",
@@ -60,16 +64,17 @@ def get_chain(num):
     return chain
 
 
-def generate(alias, num):
+def generate(alias, num, noskip_cache=False):
     chain = get_chain(num)
-    slots = [JumpSlot(i, j, alias) for i, j in enumerate(chain)]
+    line  = 0 if noskip_cache else L1I_CACHELINE
+    slots = [JumpSlot(i, j, alias, line) for i, j in enumerate(chain)]
 
     with open(f"jump_table_{alias}.S", 'w') as f:
         f.write("\n".join([
              ".section .text",
             f"   .globl do_jump_{alias}",
             f"   do_jump_{alias}:",
-            f"      bl {slots[0].label}",
+            f"      b {slots[0].label}",
              ""
         ]))
         for s in slots:
@@ -80,5 +85,5 @@ def generate(alias, num):
             f.write(s.emit_ld())
 
 generate("small", L1ITLB_ENTRIES // 2)
-generate("fit",   L1ITLB_ENTRIES)
+generate("fit",   L1ITLB_ENTRIES, True)
 generate("scrap", L1ITLB_ENTRIES * 2)
