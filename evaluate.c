@@ -185,7 +185,7 @@ __setup_page_seq(ptr_t seed, int num, int with_cacheline)
 
     unsigned long sz = num * pgsz;
     region = (char*)ensure(mmap, NULL, sz, PROT_WRITE, MAP_OPTS, 0, 0);
-    ensure(madvise, region, sz, MADV_UNMERGEABLE | MADV_NOHUGEPAGE);
+    //ensure(madvise, region, sz, MADV_NOHUGEPAGE);
 
     int index = 0;
     int blksz = !with_cacheline ? 0 : L1DCACHE_LINES;
@@ -478,7 +478,8 @@ __run_tlb_bench(struct eval_context* ctx)
     tick_nomiss = (double)nomiss.cycles;
     tick_l1miss = (double)l1miss.cycles;
 
-    n_l1 = NR_ACCESS - l1miss.l1_refill;
+    n_l1 = (double)NR_ACCESS - (double)l1miss.l1_refill;
+    n_l1 = n_l1 < 0.0 ? 0.0 : n_l1;
     tick_nomiss = (tick_nomiss - tick_pmu) / NR_ACCESS;
     tick_l1miss = (tick_l1miss - tick_pmu - n_l1 * tick_nomiss) / l1miss.l1_refill;
 

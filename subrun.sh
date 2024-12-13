@@ -7,7 +7,7 @@ if [ ! -d "$RESULT_DIR" ]; then
 fi
 
 RUNS=100
-CPU=11
+CPU=2
 
 PROG=${1:-evaluate}
 NR_REPEAT=${2:-5}
