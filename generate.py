@@ -25,14 +25,16 @@ class Config:
             f.write("#define RAND_SKIP_MAX  %d\n"%(self.randskip_max ))
 
 class JumpSlot:
-    def __init__(self, config, index, to, disambig, spam_cache=True):
+    def __init__(self, config, index, to, disambig, spam_cache=True, spam_tlb=True):
         self.section = f".jtab.{disambig}.sec_{index}"
         self.label = f"j_{disambig}_{index}"
         self.to_label = f"j_{disambig}_{to}"
         self.__to = to
         self.config = config
         self.rand_align  = config.page_size
-        self.rand_align *= random.randint(config.randskip_min, config.randskip_max)
+        
+        if (spam_tlb):
+            self.rand_align *= 16
 
         self.__pads = ["0"]
         if spam_cache:
@@ -82,9 +84,9 @@ def get_chain(num):
     return chain
 
 
-def generate_jmptab(config, alias, num, spam_cache=True):
+def generate_jmptab(config, alias, num, spam_cache=True, spam_tlb=True):
     chain = get_chain(num)
-    slots = [JumpSlot(config, i, j, alias, spam_cache) for i, j in enumerate(chain)]
+    slots = [JumpSlot(config, i, j, alias, spam_cache, spam_tlb) for i, j in enumerate(chain)]
 
     with open(f"jump_table_{alias}.S", 'w') as f:
         f.write("\n".join([
@@ -103,7 +105,7 @@ def generate_jmptab(config, alias, num, spam_cache=True):
 
 config = Config()
 
-generate_jmptab(config, "small", config.l1itlb_ents // 2)
-generate_jmptab(config, "fit",   config.l1itlb_ents, False)
-generate_jmptab(config, "scrap", config.l1itlb_ents * 2)
+# generate_jmptab(config, "small", 32, spam_tlb=True)
+# generate_jmptab(config, "fit",   32, spam_tlb=False)
+# generate_jmptab(config, "scrap", 32)
 config.gen_header()

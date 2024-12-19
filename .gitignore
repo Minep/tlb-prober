@@ -8,3 +8,5 @@ result.*
 jump_table_*
 *.ld
 results/
+
+*.pptx

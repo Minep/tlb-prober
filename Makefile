@@ -1,20 +1,15 @@
 
 OBJS := evaluate.o
 
-OBJS_JMP := jump_table_fit.o \
-			jump_table_small.o \
-			jump_table_scrap.o \
-			evaluate.jmp.o
+OBJS_JMP := evaluate.jmp.o
 
-.PHONY: modtlbi
-modtlbi:
-	$(MAKE) -C modtlbi all
+CFLAGS := -g -Og
 
 %.jmp.o: %.c
-	$(CC) -DITLB_BENCH -c $< -o $@
+	$(CC) $(CFLAGS) -DITLB_BENCH -c $< -o $@
 
 %.o: %.c
-	$(CC)  -c $< -o $@
+	$(CC) $(CFLAGS) -c $< -o $@
 
 %.o: %.S
 	$(CC)  -c $< -o $@
@@ -23,27 +18,27 @@ modtlbi:
 	$(CC) -E -x c -P $< -o $@
 
 evaluate_jmp: $(OBJS_JMP)
-	$(CC) -T link.ld -o $@ $^
+	$(CC) $(CFLAGS) -o $@ $^
 
 evaluate: $(OBJS)
-	$(CC) -o $@ $^
+	$(CC) $(CFLAGS) -o $@ $^
 
 .PHONY: all clean generate
 
 generate:
 	@./generate.py
 
-all: link.ld evaluate_jmp evaluate
+all: evaluate_jmp evaluate
 
 install:
 	@sudo insmod modtlbi/modtlbi.ko
 
 clean:
-	@rm -f evaluate evaluate_jmp jump_table_*.S jump_table_*.ldx link.ld config.h $(OBJS) $(OBJS_JMP)
+	@rm -f evaluate evaluate_jmp jump_table_*.S jump_table_*.ldx $(OBJS) $(OBJS_JMP)
 
 
 run_dtlb:
-	@./subrun.sh evaluate | ./aggregate.py
+	@./run.sh evaluate
 
 run_itlb:
-	@./subrun.sh evaluate_jmp | ./aggregate.py
+	@./run.sh evaluate_jmp

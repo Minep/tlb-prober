@@ -12,6 +12,7 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
 #include <linux/perf_event.h>
 
 #include "config.h"
@@ -48,6 +49,7 @@
         printf(#type ",%u,%llu,%llu,%llu\n", nr_i, cycle, l1, l2)
 
 typedef unsigned long ptr_t;
+typedef unsigned int  inst_t;
 
 struct read_format {
     unsigned long value;     /* The value of the event */
@@ -68,13 +70,12 @@ struct eval_param
 {
     int affinity;
     int sample_cnt;
-    int nr_scatter;
+    int nr_skip;
+    int mode;
 };
 
 struct pmu_stats {
     unsigned long long cycles;
-    unsigned long long l1_refill;
-    unsigned long long l2_refill;
 };
 
 struct eval_context
@@ -88,10 +89,7 @@ struct eval_context
     struct eval_param param;
     
     struct {
-        int tlbi_fd;
         int pmu_cycles;
-        int pmu_l2rf;
-        int pmu_l1rf;
     };
 
     struct pmu_stats stats;
@@ -116,10 +114,12 @@ __parse_args(struct eval_param* param, int argc, char** argv)
     struct option opts[] = {
         {"cpu", required_argument, 0, 'c'},
         {"samples", required_argument, 0, 'n'},
+        {"mode", required_argument, 0, 'm'},
+        {"skip", required_argument, 0, 's'},
         {0, 0, 0, 0} // Terminator
     };
     
-    while ((c = getopt_long(argc, argv, "c:n:", opts, &opti)) != 255)
+    while ((c = getopt_long(argc, argv, "c:n:m:s:", opts, &opti)) != 255)
     {
         switch (c)
         {
@@ -131,6 +131,14 @@ __parse_args(struct eval_param* param, int argc, char** argv)
                 param->sample_cnt = atoi(optarg);
             break;
 
+            case 'm':
+                param->mode = atoi(optarg);
+            break;
+
+            case 's':
+                param->nr_skip = atoi(optarg);
+            break;
+
             default:
                 printf("unknwon args: %d\n", c);
                 exit(1);
@@ -140,24 +148,36 @@ __parse_args(struct eval_param* param, int argc, char** argv)
 }
 
 static int*
-__generate_rand_chain(ptr_t seed, int num)
+__generate_rand_chain(ptr_t seed, int num, int skip)
 {
     unsigned long next = seed;
     int seqi_len = num - 1;
     int* arr = calloc(sizeof(int), seqi_len);
     int* chain = calloc(sizeof(int), num);
+    int win_sz = seqi_len, remain_sz;
+
+#ifdef ITLB_BENCH
+    if (win_sz > 8192 / skip) {
+        win_sz = 8192 / skip;
+    }
+#endif
 
     for (int i = 0; i < seqi_len; i++) {
         arr[i] = i + 1;
     }
 
-    for (int i = 0; i < seqi_len; i++) {
-        next = next * 1664525UL + 1013904223UL;
-        int r = next % (seqi_len);
-        int k = arr[i];
+    for (int j = 0; j < seqi_len; j += win_sz) {
+        remain_sz = seqi_len - j;
+        remain_sz = win_sz < remain_sz ? win_sz : remain_sz;
 
-        arr[i] = arr[r];
-        arr[r] = k;
+        for (int i = j; i < win_sz; i++) {
+            next = next * 1664525UL + 1013904223UL;
+            int r = j + next % (remain_sz);
+            int k = arr[i];
+
+            arr[i] = arr[r];
+            arr[r] = k;
+        }
     }
 
     int j = 0;
@@ -172,48 +192,97 @@ __generate_rand_chain(ptr_t seed, int num)
     return chain;
 }
 
+#define get_offset(i, blksz, nr_slot, pgsz, n)  \
+    ((i) * (pgsz) * (n) + (((i) + ((i) / (nr_slot))) % (nr_slot)) * (blksz))
+
+#define inst_b(imm)      ((0b000101 << 26) | ((imm) & ((1 << 26) - 1)))
+#define inst_ret         0xd65f03c0
+#define abs(x)           ( (x) < 0 ? -(x) : (x) )
+
+static inline void
+__set_data(char *region, ptr_t off, ptr_t off_cur)
+{
+    *(ptr_t*)(&region[off_cur]) = off + (ptr_t)region;
+}
+
+static inline void
+__set_inst(char *region, ptr_t off, ptr_t off_cur)
+{
+    inst_t* inst_buffer = (inst_t*)&region[off_cur];
+    long dist = (((long)off - (long)off_cur)) / (long)sizeof(inst_t);
+
+    if (off && (abs(dist) >> 25)) {
+        printf("immediate too big (0x%lx, 0x%lx -> 0x%lx)\n", abs(dist), off_cur, off);
+        _exit(1);
+    }
+
+    *inst_buffer = off ? inst_b(dist) : inst_ret;
+}
+
 static char*
-__setup_page_seq(ptr_t seed, int num, int with_cacheline)
+__setup_page_seq(ptr_t seed, int num, int with_cacheline, int nr_skips, ptr_t* size)
 {
     int pgsz, *chain, nr_slot;
     char *region;
-    int min_skip = 0, max_skip = 16, rand_skip = 0, prev_skip = 0;
     unsigned long next = seed + 42;
 
     pgsz = sysconf(_SC_PAGESIZE);
-    chain = __generate_rand_chain(seed, num);
+    chain = __generate_rand_chain(seed, num, nr_skips);
 
-    unsigned long sz = num * pgsz;
+    unsigned long sz = num * pgsz * nr_skips;
     region = (char*)ensure(mmap, NULL, sz, PROT_WRITE, MAP_OPTS, 0, 0);
-    //ensure(madvise, region, sz, MADV_NOHUGEPAGE);
+    madvise(region, sz, MADV_UNMERGEABLE | MADV_NOHUGEPAGE);
 
     int index = 0;
     int blksz = !with_cacheline ? 0 : L1DCACHE_LINES;
-    ptr_t off = 0;
+    ptr_t off = 0, off_cur;
     nr_slot   = pgsz / L1DCACHE_LINES;
     for (int i = 0; i < num; i++)
     {
         index = chain[i];
-        next = next * 1664525UL + 1013904223UL;
-        rand_skip = (next % min_skip) + min_skip;
 
-        off   = index % nr_slot;
-        off   = off * blksz + (index + min_skip) * pgsz;
+        off   = get_offset(index, blksz, nr_slot, pgsz, nr_skips);
+        off_cur = get_offset(i, blksz, nr_slot, pgsz, nr_skips);
         
-        *(ptr_t*)(&region[(i + min_skip) * pgsz + (i % nr_slot) * blksz]) = off;
+#ifdef ITLB_BENCH
+        __set_inst(region, off, off_cur);
+#else
+        __set_data(region, off, off_cur);
+#endif
     }
+
+#ifdef ITLB_BENCH
+    ensure(mprotect, region, sz, PROT_EXEC);
+#endif
     
     free(chain);
+    *size = sz;
     return region;
 }
 
+#define OP      "ldr x0, [x0]\n"
+#define OP4      OP OP OP OP
+#define OP16     OP4 OP4 OP4 OP4
+#define OP32     OP16 OP16
+#define OP64     OP32 OP32
+#define OP128    OP64 OP64
+#define OP256    OP128 OP128
+#define OP512    OP256 OP256
+#define OP1024   OP512 OP512
+#define OP2048   OP1024 OP1024
+
+#define NR_ACCESS 2048
+
 static inline int force_inline
-__run_bench(char* arr)
+__run_bench(ptr_t* off)
 {
-    register ptr_t off = 0;
+    register ptr_t *off_o, *off_;
+
+    off_o = off;
+    off_  = off;
     do {
-        off = *(ptr_t*)(&arr[off]);
-    } while(off);
+        off_ = *(ptr_t**)off_;
+    } while(off_o != off_);
 }
 
 static struct eval_context*
@@ -238,14 +307,6 @@ __create_context(struct eval_param* param)
     evt.pinned      = true;
     ctx->pmu_cycles = perf_event_open(&evt, getpid(), param->affinity, -1, 0);
 
-    evt.pinned = 0;
-    evt.type        = PERF_TYPE_RAW;
-    evt.config      = PMU_L2_TLB_REFILL;
-    ctx->pmu_l2rf   = perf_event_open(&evt, getpid(), param->affinity, -1, 0);
-
-    evt.config      = PMU_L1_TLB_REFILL;
-    ctx->pmu_l1rf   = perf_event_open(&evt, getpid(), param->affinity, -1, 0);
-    
     return ctx;
 }
 
@@ -253,11 +314,6 @@ static inline void force_inline
 __perf_begin(struct eval_context* ctx)
 {
     ioctl(ctx->pmu_cycles, PERF_EVENT_IOC_RESET, 0);
-    ioctl(ctx->pmu_l2rf, PERF_EVENT_IOC_RESET, 0);
-    ioctl(ctx->pmu_l1rf, PERF_EVENT_IOC_RESET, 0);
-
-    ioctl(ctx->pmu_l1rf, PERF_EVENT_IOC_ENABLE, 0);
-    ioctl(ctx->pmu_l2rf, PERF_EVENT_IOC_ENABLE, 0);
     ioctl(ctx->pmu_cycles, PERF_EVENT_IOC_ENABLE, 0);
 }
 
@@ -265,8 +321,6 @@ static inline void force_inline
 __perf_end(struct eval_context* ctx)
 {
     ioctl(ctx->pmu_cycles, PERF_EVENT_IOC_DISABLE, 0);
-    ioctl(ctx->pmu_l1rf, PERF_EVENT_IOC_DISABLE, 0);
-    ioctl(ctx->pmu_l2rf, PERF_EVENT_IOC_DISABLE, 0);
 }
 
 static void
@@ -275,21 +329,7 @@ __perf_collect(struct eval_context* ctx)
     struct read_buffer buf;
 
     ensure(read, ctx->pmu_cycles, buf.tmp_buf, READ_BUFFER_SZ);
-    ctx->stats.cycles += buf.result.value;
-
-    ensure(read, ctx->pmu_l1rf, buf.tmp_buf,   READ_BUFFER_SZ);
-    ctx->stats.l1_refill += buf.result.value;
-
-    ensure(read, ctx->pmu_l2rf, buf.tmp_buf,   READ_BUFFER_SZ);
-    ctx->stats.l2_refill += buf.result.value;
-}
-
-static inline void
-__perf_reset_stats(struct eval_context* ctx)
-{
-    ctx->stats.cycles     = 0ULL;
-    ctx->stats.l1_refill = 0ULL;
-    ctx->stats.l2_refill = 0ULL;
+    ctx->stats.cycles = buf.result.value;
 }
 
 #define perf(ctx, body)      \
@@ -299,227 +339,89 @@ __perf_reset_stats(struct eval_context* ctx)
         __perf_end(ctx);     \
     } while(0)
 
-#ifdef ITLB_BENCH
-
-#define NR_ACCESS (32)
-
-extern void do_jump_fit();
-extern void do_jump_small();
-extern void do_jump_scrap();
-
 static void no_optimize
-__run_tlb_bench(struct eval_context* ctx)
+__run_tlb_bench_seq(struct eval_context* ctx, int n)
 {
-    register int pgsz = sysconf(_SC_PAGESIZE);
-    struct pmu_stats base, nomiss, l1miss;
-    int valid = 1;
+    char *data_small;
+    int base;
+    register ptr_t *data_small_first;
+    ptr_t sz;
+    register int i = 0;
+    struct pmu_stats l1miss;
 
-    do_jump_scrap();
+    data_small = __setup_page_seq(43, n, true, ctx->param.nr_skip, &sz);
+    data_small_first = (ptr_t*)(*((ptr_t*)data_small));
 
-    // warm up
     perf(ctx, { });
 
-    // correction for noise
+    // // correction for noise
     perf(ctx, { });
     __perf_collect(ctx);
-    
-    log(overhead, 0
-            , ctx->stats.cycles    
-            , ctx->stats.l1_refill
-            , ctx->stats.l2_refill);
-    base = ctx->stats;
-    
-    __perf_reset_stats(ctx);
+    base = ctx->stats.cycles;
 
-    // warm up
-    perf(ctx, {
-        do_jump_small();
-    });
-    
-    // no miss
-    perf(ctx, {
-        do_jump_small();
-    });
-    __perf_collect(ctx);
-    
-    log(no_miss , NR_ACCESS
-                , ctx->stats.cycles
-                , ctx->stats.l1_refill
-                , ctx->stats.l2_refill);
-    nomiss = ctx->stats;
-    valid = valid && !nomiss.l1_refill && !nomiss.l2_refill;
-    __perf_reset_stats(ctx);
-
-    do_jump_scrap();
-
-    // l1 miss
-    
-    perf(ctx, {
-        do_jump_small();
-    });
-
-    do_jump_fit();
-
-    perf(ctx, {
-        do_jump_small();
-    });
-    __perf_collect(ctx);
-
-    log(l1miss, NR_ACCESS
-              , ctx->stats.cycles
-              , ctx->stats.l1_refill
-              , ctx->stats.l2_refill);
-
-    l1miss = ctx->stats;
-    valid = valid && l1miss.l1_refill && !l1miss.l2_refill;
-    __perf_reset_stats(ctx);
-
-    double tick_pmu, tick_nomiss, tick_l1miss, tick_mmu;
-    double tick_l1lat, tick_l2lat, tick_mmu_tot;
-    double n_l1, compensate, l1l2;
-    
-    tick_pmu = (double)base.cycles;
-    tick_nomiss = (double)nomiss.cycles;
-    tick_l1miss = (double)l1miss.cycles;
-
-    n_l1 = NR_ACCESS - l1miss.l1_refill;
-    tick_nomiss = (tick_nomiss - tick_pmu) / NR_ACCESS;
-    tick_l1miss = (tick_l1miss - tick_pmu - n_l1 * tick_nomiss) / l1miss.l1_refill;
-
-    tick_mmu = tick_l1miss - tick_nomiss;
-
-    printf("lat-note, inst, iex+lsu, l2_hit, may_invl\n");
-    printf("lat     ,%0.2lf,%0.2lf,%0.2lf,%d\n", 
-            tick_l1miss, tick_nomiss, tick_mmu, !valid);
-}
+#ifndef ITLB_BENCH
+        __run_bench(data_small_first);
 #else
-
-#define NR_ACCESS (L1DTLB_ENTRIES / 2)
-#define NR_SCRAP  (L1DTLB_ENTRIES * L1DTLB_WAYS)
-
-static void no_optimize
-__run_tlb_bench(struct eval_context* ctx)
-{
-    register char *data, *data_small, *scrap;
-    register int pgsz = sysconf(_SC_PAGESIZE);
-    struct pmu_stats base, nomiss, l1miss;
-    int valid = 1;
-
-    scrap = __setup_page_seq(11, NR_SCRAP, true);
-    data = __setup_page_seq(43, L1DTLB_ENTRIES, 0);
-    data_small = __setup_page_seq(97, NR_ACCESS, true);
-
-    __run_bench(scrap);
-
-    // warm up
-    perf(ctx, { });
-
-    // correction for noise
-    perf(ctx, { });
-    __perf_collect(ctx);
+        asm volatile ("blr %0\n" ::"r"(data_small));
+#endif
     
-    log(overhead, 0
-            , ctx->stats.cycles    
-            , ctx->stats.l1_refill
-            , ctx->stats.l2_refill);
-    base = ctx->stats;
-    
-    __perf_reset_stats(ctx);
-
-    // warm up
     perf(ctx, {
-        __run_bench(data_small);
-    });
-    
-    // no miss
-    perf(ctx, {
-        __run_bench(data_small);
+        while(i++ < 10000) {
+#ifndef ITLB_BENCH
+        __run_bench(data_small_first);
+#else
+        asm volatile ("blr %0\n" ::"r"(data_small));
+#endif
+        }
+
     });
     __perf_collect(ctx);
-    
-    log(no_miss , NR_ACCESS
-                , ctx->stats.cycles
-                , ctx->stats.l1_refill
-                , ctx->stats.l2_refill);
-    nomiss = ctx->stats;
-    valid = valid && !nomiss.l1_refill && !nomiss.l2_refill;
-    __perf_reset_stats(ctx);
-
-    __run_bench(scrap);
-
-    // l1 miss
-    
-    perf(ctx, {
-        __run_bench(data_small);
-    });
-
-    __run_bench(data);
-
-    perf(ctx, {
-        __run_bench(data_small);
-    });
-    __perf_collect(ctx);
-
-    log(l1miss, NR_ACCESS
-              , ctx->stats.cycles
-              , ctx->stats.l1_refill
-              , ctx->stats.l2_refill);
 
     l1miss = ctx->stats;
-    valid = valid && l1miss.l1_refill && !l1miss.l2_refill;
-    __perf_reset_stats(ctx);
 
+    double inst_cycle;
 
-    double tick_pmu, tick_nomiss, tick_l1miss, tick_mmu;
-    double tick_l1lat, tick_l2lat, tick_mmu_tot;
-    double n_l1, compensate, l1l2;
-    
-    tick_pmu = (double)base.cycles;
-    tick_nomiss = (double)nomiss.cycles;
-    tick_l1miss = (double)l1miss.cycles;
-
-    n_l1 = (double)NR_ACCESS - (double)l1miss.l1_refill;
-    n_l1 = n_l1 < 0.0 ? 0.0 : n_l1;
-    tick_nomiss = (tick_nomiss - tick_pmu) / NR_ACCESS;
-    tick_l1miss = (tick_l1miss - tick_pmu - n_l1 * tick_nomiss) / l1miss.l1_refill;
-
-    tick_mmu = tick_l1miss - tick_nomiss;
-
-    printf("lat-note, inst, iex+lsu, l2_hit, may_invl\n");
-    printf("lat     ,%0.2lf,%0.2lf,%0.2lf,%d\n", 
-            tick_l1miss, tick_nomiss, tick_mmu, !valid);
-}
-#endif
-
-static void no_optimize
-run_bench(struct eval_context* ctx)
-{
-    __run_tlb_bench(ctx);
+    inst_cycle = ((double)l1miss.cycles - base) / n;
+    printf("%0.4lf\n", inst_cycle / 10000.0);
+    munmap(data_small, sz);
 }
 
 static void
 cleanup(struct eval_context* ctx)
 {
     close(ctx->pmu_cycles);
-    close(ctx->pmu_l1rf);
-    close(ctx->pmu_l2rf);
 }
 
-int no_optimize
+#define KiB 1024
+#define MiB KiB * KiB
+#define GiB MiB * KiB
+
+int
 main(int argc, char** argv)
 {
     struct eval_param param;
     struct eval_context* ctx;
+    int valid;
 
-    srand(0);
+    struct rlimit lim = {
+        .rlim_cur = 1 * GiB,
+        .rlim_max = 1 * GiB
+    };
+
+    setrlimit(RLIMIT_DATA, &lim);
+
     __parse_args(&param, argc, argv);
 
     ctx = __create_context(&param);
-    
-    for (int i = 0; i < ctx->param.sample_cnt; i++)
+
+    for (int i = 0; i < ctx->param.sample_cnt;i++)
     {
-        run_bench(ctx);
+        if (!param.mode) {
+            __run_tlb_bench_seq(ctx, 1 << i);
+        }
+        else {
+            __run_tlb_bench_seq(ctx, (i+1) * param.mode);
+        }
     }
-    
     cleanup(ctx);
 }
