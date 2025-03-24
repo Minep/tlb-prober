@@ -13,6 +13,7 @@
 #include <sys/syscall.h>
 #include <sys/ioctl.h>
 #include <sys/resource.h>
+#include <sys/types.h>
 #include <linux/perf_event.h>
 
 #include "config.h"
@@ -39,7 +40,7 @@
     ({                                                      \
         long ret = (long)call(__VA_ARGS__);                 \
         if (ret < 0) {                                      \
-            printf("failed: " #call "(" #__VA_ARGS__ "), error: %s\n", strerror(errno));   \
+            printf("failed: " #call "(" #__VA_ARGS__ "), error: %d, %s\n", errno, strerror(errno));   \
             exit(1);                                        \
         }                                                   \
         ret;                                                \
@@ -70,6 +71,7 @@ struct eval_param
 {
     int affinity;
     int sample_cnt;
+    int start;
     int nr_skip;
     int mode;
 };
@@ -116,10 +118,17 @@ __parse_args(struct eval_param* param, int argc, char** argv)
         {"samples", required_argument, 0, 'n'},
         {"mode", required_argument, 0, 'm'},
         {"skip", required_argument, 0, 's'},
+        {"start", required_argument, 0, 'o'},
         {0, 0, 0, 0} // Terminator
     };
+
+    param->affinity = 0;
+    param->sample_cnt = 1;
+    param->mode = 1;
+    param->nr_skip = 1;
+    param->start = 0;
     
-    while ((c = getopt_long(argc, argv, "c:n:m:s:", opts, &opti)) != 255)
+    while ((c = getopt_long(argc, argv, "c:n:m:s:o:", opts, &opti)) != 255)
     {
         switch (c)
         {
@@ -139,6 +148,10 @@ __parse_args(struct eval_param* param, int argc, char** argv)
                 param->nr_skip = atoi(optarg);
             break;
 
+            case 'o':
+                param->start = atoi(optarg);
+            break;
+
             default:
                 printf("unknwon args: %d\n", c);
                 exit(1);
@@ -150,6 +163,7 @@ __parse_args(struct eval_param* param, int argc, char** argv)
 static int*
 __generate_rand_chain(ptr_t seed, int num, int skip)
 {
+    srand(seed);
     unsigned long next = seed;
     int seqi_len = num - 1;
     int* arr = calloc(sizeof(int), seqi_len);
@@ -168,11 +182,11 @@ __generate_rand_chain(ptr_t seed, int num, int skip)
 
     for (int j = 0; j < seqi_len; j += win_sz) {
         remain_sz = seqi_len - j;
-        remain_sz = win_sz < remain_sz ? win_sz : remain_sz;
+        remain_sz = remain_sz < win_sz ? remain_sz : win_sz;
 
-        for (int i = j; i < win_sz; i++) {
-            next = next * 1664525UL + 1013904223UL;
-            int r = j + next % (remain_sz);
+        for (int i = j; i < j + remain_sz; i++) {
+            //next = next * 1664525UL + 1013904223UL;
+            int r = j + (unsigned int)rand() % (remain_sz);
             int k = arr[i];
 
             arr[i] = arr[r];
@@ -224,7 +238,7 @@ __setup_page_seq(ptr_t seed, int num, int with_cacheline, int nr_skips, ptr_t* s
 {
     int pgsz, *chain, nr_slot;
     char *region;
-    unsigned long next = seed + 42;
+    unsigned long next = seed;
 
     pgsz = sysconf(_SC_PAGESIZE);
     chain = __generate_rand_chain(seed, num, nr_skips);
@@ -251,6 +265,23 @@ __setup_page_seq(ptr_t seed, int num, int with_cacheline, int nr_skips, ptr_t* s
 #endif
     }
 
+#ifndef ITLB_BENCH
+    ptr_t *off_o, *off_;
+    int i = 0;
+
+    off_o = (ptr_t*)region;
+    off_  = (ptr_t*)region;
+    do {
+        off_ = *(ptr_t**)off_;
+        i++;
+    } while(off_o != off_);
+
+    if (i != num) {
+        printf("unmatched: %d, expect %d\n", i, num);
+        exit(1);
+    };
+#endif
+
 #ifdef ITLB_BENCH
     ensure(mprotect, region, sz, PROT_EXEC);
 #endif
@@ -260,29 +291,48 @@ __setup_page_seq(ptr_t seed, int num, int with_cacheline, int nr_skips, ptr_t* s
     return region;
 }
 
-#define OP      "ldr x0, [x0]\n"
-#define OP4      OP OP OP OP
-#define OP16     OP4 OP4 OP4 OP4
-#define OP32     OP16 OP16
-#define OP64     OP32 OP32
-#define OP128    OP64 OP64
-#define OP256    OP128 OP128
-#define OP512    OP256 OP256
-#define OP1024   OP512 OP512
-#define OP2048   OP1024 OP1024
-
-#define NR_ACCESS 2048
-
-static inline int force_inline
-__run_bench(ptr_t* off)
+static void
+__print_vas(ptr_t* off)
 {
-    register ptr_t *off_o, *off_;
+    int fd;
+    ptr_t pfn;
+    fd = ensure(open, "/proc/self/pagemap", O_RDONLY);
+
+    ptr_t *off_o, *off_, pg_off;
 
     off_o = off;
     off_  = off;
     do {
+        ensure(lseek, fd, (unsigned long)(off_) / 4096 * sizeof(ptr_t), SEEK_SET);
+        ensure(read, fd, (char*)&pfn, sizeof(ptr_t));
+        printf("vfn: 0x%lx -> pfn: 0x%lx\n", (unsigned long)(off_) / 4096, pfn);
+
         off_ = *(ptr_t**)off_;
     } while(off_o != off_);
+
+    close(fd);
+}
+
+#define OP  "ldr x0, [x0]\n"
+#define OP6 OP OP OP OP OP OP
+#define OP24 OP6 OP6 OP6 OP6
+#define OP96 OP24 OP24 OP24 OP24
+#define OP384 OP96 OP96 OP96 OP96
+#define OP1536 OP384 OP384 OP384 OP384
+
+static inline int force_inline
+__run_bench(ptr_t* off, int n)
+{
+    asm volatile (
+        "mov x0, %0\n"
+        "mov x1, #0\n"
+        "1:\n"
+        OP1536
+        "add x1, x1, #1\n"
+        "cmp x1, %1\n"
+        "bne 1b\n"
+        ::"r"(off), "r"(n): "x0", "x1"
+    );
 }
 
 static struct eval_context*
@@ -340,7 +390,7 @@ __perf_collect(struct eval_context* ctx)
     } while(0)
 
 static void no_optimize
-__run_tlb_bench_seq(struct eval_context* ctx, int n)
+__run_tlb_bench_seq(struct eval_context* ctx, int n, int idx)
 {
     char *data_small;
     int base;
@@ -349,7 +399,7 @@ __run_tlb_bench_seq(struct eval_context* ctx, int n)
     register int i = 0;
     struct pmu_stats l1miss;
 
-    data_small = __setup_page_seq(43, n, true, ctx->param.nr_skip, &sz);
+    data_small = __setup_page_seq(idx * 42, n, true, ctx->param.nr_skip, &sz);
     data_small_first = (ptr_t*)(*((ptr_t*)data_small));
 
     perf(ctx, { });
@@ -359,8 +409,10 @@ __run_tlb_bench_seq(struct eval_context* ctx, int n)
     __perf_collect(ctx);
     base = ctx->stats.cycles;
 
+    int _n = n / 1536 + 1;
+
 #ifndef ITLB_BENCH
-        __run_bench(data_small_first);
+        __run_bench(data_small_first, _n);
 #else
         asm volatile ("blr %0\n" ::"r"(data_small));
 #endif
@@ -368,7 +420,7 @@ __run_tlb_bench_seq(struct eval_context* ctx, int n)
     perf(ctx, {
         while(i++ < 10000) {
 #ifndef ITLB_BENCH
-        __run_bench(data_small_first);
+        __run_bench(data_small_first, _n);
 #else
         asm volatile ("blr %0\n" ::"r"(data_small));
 #endif
@@ -377,12 +429,22 @@ __run_tlb_bench_seq(struct eval_context* ctx, int n)
     });
     __perf_collect(ctx);
 
+    // printf("==========\n");
+    // __print_vas(data_small_first);
+
     l1miss = ctx->stats;
 
     double inst_cycle;
 
+#ifdef ITLB_BENCH
     inst_cycle = ((double)l1miss.cycles - base) / n;
+#else
+    inst_cycle = ((double)l1miss.cycles - base) / (1536.0 * _n);
+#endif
     printf("%0.4lf\n", inst_cycle / 10000.0);
+
+    // printf("==========\n\n");
+
     munmap(data_small, sz);
 }
 
@@ -392,7 +454,7 @@ cleanup(struct eval_context* ctx)
     close(ctx->pmu_cycles);
 }
 
-#define KiB 1024
+#define KiB 1024UL
 #define MiB KiB * KiB
 #define GiB MiB * KiB
 
@@ -404,23 +466,25 @@ main(int argc, char** argv)
     int valid;
 
     struct rlimit lim = {
-        .rlim_cur = 1 * GiB,
-        .rlim_max = 1 * GiB
+        .rlim_cur = 8UL * GiB,
+        .rlim_max = 8UL * GiB
     };
 
-    setrlimit(RLIMIT_DATA, &lim);
+    ensure(setrlimit, RLIMIT_DATA, &lim);
 
     __parse_args(&param, argc, argv);
 
     ctx = __create_context(&param);
 
-    for (int i = 0; i < ctx->param.sample_cnt;i++)
+    int end = param.sample_cnt + param.start;
+
+    for (int i = param.start; i < end; i++)
     {
         if (!param.mode) {
-            __run_tlb_bench_seq(ctx, 1 << i);
+            __run_tlb_bench_seq(ctx, 1 << i, i);
         }
         else {
-            __run_tlb_bench_seq(ctx, (i+1) * param.mode);
+            __run_tlb_bench_seq(ctx, (i+1) * param.mode, i);
         }
     }
     cleanup(ctx);
